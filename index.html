@@ -9,4 +9,346 @@
     <h1>Welcome to My GitHub Pages Site</h1>
     <p>This is my first GitHub Pages deployment!</p>
 </body>
+
 </html>
+
+from google import genai
+from google.genai import types  # ← これを追加
+
+client = genai.Client(vertexai=True, api_key="YOUR_API_KEY")
+
+response = client.models.generate_content(
+    model="gemini-2.0-flash-001",
+    config=types.GenerateContentConfig(
+        # ここが「上位指示」= system instruction
+        system_instruction=(
+            "あなたは厳密で簡潔なテクニカルライターです。"
+            "出力は必ず日本語。箇条書きはハイフン(-)で、"
+            "余計な前置きは書かないでください。"
+        ),
+
+    ),
+    contents="バブルソートを高校生にもわかるように要点3つで説明して。",
+)
+・・・・・・・・・・・・・・
+
+# core/views.py
+import os
+from django.views import View
+from django.shortcuts import render
+from django.views.decorators.csrf import csrf_protect
+from django.utils.decorators import method_decorator
+
+from google import genai
+from google.genai import types
+
+# 環境変数 or settings からキー取得（Vertex経由でも api_key を渡せます）
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY")
+MODEL_NAME = "gemini-2.0-flash-001"
+
+# 上位指示（system_instruction）— 好きに書き換え可
+SYSTEM_INST = (
+    "あなたは簡潔で実務的な日本語アシスタントです。"
+    "コードは最小例から提示し、不要な前置きは避けます。"
+)
+
+# セッションに溜めすぎると重いので最後の N ターンだけ使う
+MAX_TURNS = 8  # ユーザー→モデルで1ターン。直近8ターン保持。
+
+client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
+
+@method_decorator(csrf_protect, name="dispatch")
+class SimpleChatView(View):
+    template_name = "core/chat.html"
+
+    def _get_history(self, request):
+        """セッションから履歴を取得（なければ初期化）"""
+        hist = request.session.get("chat_history", [])
+        # hist は [{"role":"user","content":"..."},{"role":"model","content":"..."}...]
+        return hist
+
+    def _save_history(self, request, history):
+        """履歴をセッションに保存（直近MAX_TURNS*2 件に切り詰め）"""
+        trimmed = history[-MAX_TURNS*2:]
+        request.session["chat_history"] = trimmed
+        request.session.modified = True
+
+    def get(self, request):
+        return render(self.template_name, {"messages": self._get_history(request)})
+
+    def post(self, request):
+        user_text = (request.POST.get("prompt") or "").strip()
+        history = self._get_history(request)
+
+        # google-genai の history 形式へ変換
+        genai_history = []
+        for m in history:
+            genai_history.append(
+                types.Content(role=m["role"], parts=[m["content"]])
+            )
+
+        # チャットセッション作成（毎回作ってOK：履歴を渡すだけ）
+        chat = client.chats.create(
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INST,
+                temperature=0.5,
+                top_p=0.9,
+                max_output_tokens=1024,
+            ),
+            history=genai_history,
+        )
+
+        # 送信→受信
+        answer = ""
+        if user_text:
+            history.append({"role": "user", "content": user_text})
+            try:
+                res = chat.send_message(user_text)
+                answer = res.text or ""
+            except Exception as e:
+                answer = f"(エラー) {e}"
+
+            history.append({"role": "model", "content": answer})
+            self._save_history(request, history)
+
+        return render(self.template_name, {"messages": history})
+.............
+
+
+# core/views.py
+import os
+from django.http import JsonResponse
+from django.shortcuts import render
+from django.views.decorators.http import require_POST
+from django.views.decorators.csrf import csrf_protect
+
+from google import genai
+from google.genai import types
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY")
+MODEL_NAME = "gemini-2.0-flash-001"
+
+client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
+
+# --- System Instruction（上位指示） ---
+SYSTEM_REVEAL = (
+    "あなたはReveal.jsのスライド生成アシスタントです。"
+    "必ず日本語で、指示されたプロンプト内容からプレゼンを作ります。"
+    "出力は『Reveal.jsの <section> スライド断片のみ』です（<div class='reveal'> など全体骨格は不要）。"
+    "各スライドは <section> ... </section> とし、1スライド1トピック。"
+    "見出し <h2>、要点は <ul><li>…</li></ul> を基本にし、必要に応じて <pre><code>…</code></pre> でコードも含める。"
+    "画像が必要なら alt テキストだけ置き、実ファイル参照はしない。"
+    "余計な説明文やバッククォートは出力しない。HTML断片だけを返す。"
+)
+
+SYSTEM_PPTX = (
+    "あなたはpython-pptxでPowerPointを自動生成するコードを出力するアシスタントです。"
+    "必ず日本語でコメントを入れつつ、実行すれば即 'output.pptx' を生成する完全なPythonコードのみを出力します。"
+    "コードは from pptx import Presentation など必要なimportを含め、各スライドのレイアウト指定・タイトル・箇条書き追加を行うこと。"
+    "余計な解説やバッククォートは出力しない。Pythonコードのみ返す。"
+)
+
+def slide_page(request):
+    return render(request, "core/slide.html")
+
+@require_POST
+@csrf_protect
+def gen_slide_api(request):
+    """
+    mode=reveal|pptx
+    prompt=ユーザーの要求
+    return JSON: {ok, kind, code[, htmlPreview]}
+    """
+    mode = (request.POST.get("mode") or "reveal").strip().lower()
+    prompt = (request.POST.get("prompt") or "").strip()
+    if not prompt:
+        return JsonResponse({"ok": False, "error": "promptは必須です"}, status=400)
+
+    if mode not in ("reveal", "pptx"):
+        return JsonResponse({"ok": False, "error": "modeは reveal または pptx"}, status=400)
+
+    try:
+        if mode == "reveal":
+            # Reveal.js用：HTML <section>…</section> 断片だけを作らせる
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_REVEAL,
+                    temperature=0.4, top_p=0.9, max_output_tokens=2048,
+                ),
+                contents=f"次の内容でスライドを作ってください：\n{prompt}",
+            )
+            fragment = (resp.text or "").strip()
+            if not fragment:
+                return JsonResponse({"ok": False, "error": "生成が空でした"}, status=500)
+
+            # 返却：生成された断片（=コード）と、即時プレビュー用の完成HTML
+            preview_html = build_reveal_html(fragment)
+            return JsonResponse({"ok": True, "kind": "reveal", "code": fragment, "htmlPreview": preview_html})
+
+        else:
+            # python-pptx用：実行すると output.pptx を作る完全コードを出させる
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PPTX,
+                    temperature=0.4, top_p=0.9, max_output_tokens=2048,
+                ),
+                contents=f"次の内容でスライドを作ってください：\n{prompt}",
+            )
+            pycode = (resp.text or "").strip()
+            if not pycode:
+                return JsonResponse({"ok": False, "error": "生成が空でした"}, status=500)
+
+            # Web即プレビューは難しいのでコードのみ返却（ダウンロード・ローカル実行を想定）
+            return JsonResponse({"ok": True, "kind": "pptx", "code": pycode})
+
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
+
+
+def build_reveal_html(slides_fragment: str) -> str:
+    """
+    受け取った <section>…</section> 群を Reveal.js の最小骨格に流し込む。
+    CDN読み込みでシンプルに。
+    """
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Preview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/reveal.js/dist/reveal.css">
+  <link rel="stylesheet" href="https://unpkg.com/reveal.js/dist/theme/black.css" id="theme">
+  <style>code{{font-size:0.9em}}</style>
+</head>
+<body>
+  <div class="reveal"><div class="slides">
+    {slides_fragment}
+  </div></div>
+  <script src="https://unpkg.com/reveal.js/dist/reveal.js"></script>
+  <script>
+    const deck = new Reveal({{hash: true, slideNumber: true}});
+    deck.initialize({{
+      controls: true, progress: true, center: true, width: 1200, height: 700
+    }});
+  </script>
+</body>
+</html>"""
+。。。。
+
+        # core/urls.py
+from django.urls import path
+from .views import slide_page, gen_slide_api
+
+urlpatterns = [
+    path("", slide_page, name="slide_page"),
+    path("api/gen-slide/", gen_slide_api, name="gen_slide_api"),
+]
+・・・
+
+        <!-- core/templates/core/slide.html -->
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>スライド自動生成（Reveal.js / python-pptx）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 24px; }
+    .wrap { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+    textarea { width: 100%; min-height: 160px; }
+    select, button { padding: 8px 12px; }
+    .row { display: grid; gap: 8px; }
+    .code { white-space: pre; overflow: auto; background: #0b1020; color: #d1e7ff; padding: 12px; border-radius: 8px; }
+    iframe { width: 100%; height: 560px; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .muted { color: #6b7280; }
+  </style>
+  <script>
+    function getCookie(name){
+      const value = `; ${document.cookie}`; const parts = value.split(`; ${name}=`);
+      if(parts.length===2) return parts.pop().split(';').shift();
+    }
+    const csrftoken = getCookie('csrftoken');
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Geminiでスライド自動生成</h1>
+
+    <div class="row">
+      <label>生成方式
+        <select id="mode">
+          <option value="reveal" selected>Reveal.js（即プレビュー向き）</option>
+          <option value="pptx">python-pptx（配布用PPTX）</option>
+        </select>
+      </label>
+
+      <label>プロンプト
+        <textarea id="prompt" placeholder="例）オブジェクト指向入門：クラス/継承/ポリモーフィズム。受講者は初心者、全8枚、各スライドに例と要点3つ。コード例はPython。"></textarea>
+      </label>
+
+      <div>
+        <button id="run">生成</button>
+        <span id="status" class="muted"></span>
+      </div>
+    </div>
+
+    <h2>生成されたコード</h2>
+    <div id="code" class="code"></div>
+
+    <div id="preview-block" style="display:none;">
+      <h2>スライド・プレビュー（Reveal.js）</h2>
+      <iframe id="preview"></iframe>
+    </div>
+  </div>
+
+  <script>
+    const runBtn = document.getElementById('run');
+    const modeEl = document.getElementById('mode');
+    const promptEl = document.getElementById('prompt');
+    const statusEl = document.getElementById('status');
+    const codeEl = document.getElementById('code');
+    const previewBlock = document.getElementById('preview-block');
+    const preview = document.getElementById('preview');
+
+    runBtn.addEventListener('click', async () => {
+      const prompt = promptEl.value.trim();
+      const mode = modeEl.value;
+      if(!prompt){ statusEl.textContent = 'promptは必須です'; return; }
+
+      statusEl.textContent = '生成中...';
+      codeEl.textContent = '';
+      previewBlock.style.display = 'none';
+      preview.srcdoc = '';
+
+      const form = new FormData();
+      form.append('prompt', prompt);
+      form.append('mode', mode);
+
+      try{
+        const res = await fetch("{% url 'gen_slide_api' %}", {
+          method: 'POST',
+          headers: {'X-CSRFToken': csrftoken},
+          body: form
+        });
+        const data = await res.json();
+        if(!data.ok){ statusEl.textContent = 'エラー: ' + (data.error||''); return; }
+
+        statusEl.textContent = '完了';
+        codeEl.textContent = data.code || '';
+
+        if(data.kind === 'reveal' && data.htmlPreview){
+          previewBlock.style.display = 'block';
+          preview.srcdoc = data.htmlPreview; // ここで即プレビュー
+        }
+      }catch(e){
+        statusEl.textContent = '通信エラー: ' + e;
+      }
+    });
+  </script>
+</body>
+</html>
+
+
