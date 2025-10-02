@@ -351,4 +351,14 @@ urlpatterns = [
 </body>
 </html>
 
+・・・・・・・・・・
+
+        types の import忘れ → from google.genai import types
+
+モデル名の表記揺れ（-001 / -002 など）→ Vertex の最新リファレンスで確認。 
+Google Cloud
+
+環境混在（Developer API と Vertex を同時に使う設定）→ 今回は Client(vertexai=True) でVertex 経由に固定。
+
+必要なら、この config をDjango の View／サービス層に組み込んだ完全サンプル（CSRF、タイムアウト、リトライ、監査ログ付き）もすぐ出します。
 
