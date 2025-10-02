@@ -362,3 +362,171 @@ Google Cloud
 
 必要なら、この config をDjango の View／サービス層に組み込んだ完全サンプル（CSRF、タイムアウト、リトライ、監査ログ付き）もすぐ出します。
 
+
+基本の考え方
+
+フロント側
+
+複数の <button> に data-mode="xxx" のような属性を持たせる
+
+JS でボタンをクリックしたときに「mode」を渡して同じAPI関数を呼ぶ
+
+サーバ側（Django view）
+
+同じ generate_api(request) で受け取り、request.POST.get("mode") を見て処理を分ける
+
+例：mode == "reveal" → Reveal.jsコード生成、mode == "pptx" → python-pptxコード生成
+
+
+    <form id="gen-form" onsubmit="return false;">
+  <textarea id="prompt" placeholder="スライド内容"></textarea>
+  <div>
+    <button type="button" class="gen-btn" data-mode="reveal">Reveal.js で生成</button>
+    <button type="button" class="gen-btn" data-mode="pptx">python-pptx で生成</button>
+    <button type="button" class="gen-btn" data-mode="md">Markdownで生成</button>
+  </div>
+</form>
+
+<div id="status"></div>
+<pre id="code"></pre>
+・・・・
+    const csrftoken = getCookie("csrftoken");
+const promptEl = document.getElementById("prompt");
+const statusEl = document.getElementById("status");
+const codeEl = document.getElementById("code");
+
+document.querySelectorAll(".gen-btn").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const mode = btn.dataset.mode;   // ← ボタンの data-mode を取得
+    const prompt = promptEl.value.trim();
+    if (!prompt) {
+      statusEl.textContent = "プロンプト必須です";
+      return;
+    }
+
+    statusEl.textContent = "生成中...";
+    codeEl.textContent = "";
+
+    const form = new FormData();
+    form.append("prompt", prompt);
+    form.append("mode", mode);
+
+    const res = await fetch("/api/gen-slide/", {
+      method: "POST",
+      headers: {"X-CSRFToken": csrftoken},
+      body: form
+    });
+    const data = await res.json();
+
+    if (!data.ok) {
+      statusEl.textContent = "エラー: " + (data.error || "");
+      return;
+    }
+    statusEl.textContent = "完了";
+    codeEl.textContent = data.code;
+  });
+});
+。。。
+
+    @require_POST
+@csrf_protect
+def gen_slide_api(request):
+    mode = (request.POST.get("mode") or "reveal").lower()
+    prompt = (request.POST.get("prompt") or "").strip()
+    if not prompt:
+        return JsonResponse({"ok": False, "error": "prompt必須"}, status=400)
+
+    try:
+        if mode == "reveal":
+            # Reveal.js用のsystem instructionで生成
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_REVEAL,
+                    temperature=0.4,
+                    top_p=0.9,
+                    max_output_tokens=2048,
+                ),
+                contents=prompt,
+            )
+            return JsonResponse({"ok": True, "code": resp.text})
+
+        elif mode == "pptx":
+            # python-pptx用のsystem instructionで生成
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PPTX,
+                    temperature=0.4,
+                ),
+                contents=prompt,
+            )
+            return JsonResponse({"ok": True, "code": resp.text})
+
+        elif mode == "md":
+            # Markdownで生成
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction="Markdownでスライド構成を書く",
+                ),
+                contents=prompt,
+            )
+            return JsonResponse({"ok": True, "code": resp.text})
+
+        else:
+            return JsonResponse({"ok": False, "error": f"未対応mode: {mode}"}, status=400)
+
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
+
+
+
+    ・・・
+    DjangoでのJS配置のデフォルトの流れ
+
+アプリの下に static/ フォルダを作る
+例：core/
+  views.py
+  templates/core/ask.html
+  static/core/app.js   ←ここにJSファイル
+settings.py で STATICFILES_DIRS/STATIC_URL を確認
+通常はデフォルトで
+    STATIC_URL = "/static/"
+
+    となっています。
+
+HTMLテンプレートで {% load static %} を宣言してJSを読み込
+{% load static %}
+<!doctype html>
+<html>
+<head>
+  <script src="{% static 'core/app.js' %}"></script>
+</head>
+<body>
+  ...
+</body>
+</html>
+app.js に先ほどのJavaScriptコードを書く
+// core/static/core/app.js
+
+document.addEventListener("DOMContentLoaded", () => {
+  const csrftoken = getCookie("csrftoken");
+  const promptEl = document.getElementById("prompt");
+  const statusEl = document.getElementById("status");
+  const codeEl = document.getElementById("code");
+
+  document.querySelectorAll(".gen-btn").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const mode = btn.dataset.mode;
+      const prompt = promptEl.value.trim();
+      ...
+    });
+  });
+});
+
+function getCookie(name) {
+  const value = `; ${document.cookie}`;
+  const parts = value.split(`; ${name}=`);
+  if (parts.length === 2) return parts.pop().split(';').shift();
+}
